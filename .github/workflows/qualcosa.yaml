@@ -25,7 +25,6 @@ jobs:
       - name: Setup Variables
         shell: bash
         run: |
-          SUBSCRIPTION_ID=$(az account list | jq -r '.[0].id')
           echo "RESOURCE_GROUP=${{ github.event.inputs.resource-group-name || 'ic-aks-rg' }}" >> $GITHUB_ENV
 
           echo "AKS_NAME=${{ github.event.inputs.aks-name || 'ic-aks' }}" >> $GITHUB_ENV
@@ -88,6 +87,8 @@ jobs:
 
               echo "Apply Reader role to the AKS managed cluster resource group for the newly provisioned identity"
               az role assignment create --assignee-object-id $principalId --assignee-principal-type ServicePrincipal --scope $mcResourceGroupId --role "acdd72a7-3385-48ef-bd42-f606fba81ae7" # Reader role
+              echo "Apply Microsoft.Authorization/roleAssignments/write role to the AKS managed cluster resource group for the newly provisioned identity"
+              az role assignment create --assignee-object-id $principalId --assignee-principal-type ServicePrincipal --scope $mcResourceGroupId --role "3edba951-2d8b-4aad-9c7d-d1454919d3cb" # Microsoft.Authorization/roleAssignments/write
 
               echo "Set up federation with AKS OIDC issuer"
               AKS_OIDC_ISSUER="$(az aks show -n "$AKS_NAME" -g "$RESOURCE_GROUP" --query "oidcIssuerProfile.issuerUrl" -o tsv)"
