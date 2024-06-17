@@ -25,11 +25,12 @@ jobs:
       - name: Setup Variables
         shell: bash
         run: |
+          SUBSCRIPTION_ID=$(az account list | jq -r '.[0].id')
           echo "RESOURCE_GROUP=${{ github.event.inputs.resource-group-name || 'ic-aks-rg' }}" >> $GITHUB_ENV
 
           echo "AKS_NAME=${{ github.event.inputs.aks-name || 'ic-aks' }}" >> $GITHUB_ENV
 
-          echo "subscription_id=$(az account list | jq -r '.[0].id')" >> $GITHUB_ENV
+          echo "SUBSCRIPTION_ID=$(az account list | jq -r '.[0].id')" >> $GITHUB_ENV
 
           echo "IDENTITY_RESOURCE_NAME=${{ 'azure-alb-identity' }}" >> $GITHUB_ENV
 
