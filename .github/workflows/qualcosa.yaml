@@ -29,7 +29,7 @@ jobs:
 
           echo "AKS_NAME=${{ github.event.inputs.aks-name || 'ic-aks' }}" >> $GITHUB_ENV
 
-          echo "SUBSCRIPTION_ID=${{ 'c550fb2d-3f43-40b7-9e36-f1d47f436e42' }}" >> $GITHUB_ENV
+          echo "subscription_id=$(az account list | jq -r '.[0].id')" >> $GITHUB_ENV
 
           echo "IDENTITY_RESOURCE_NAME=${{ 'azure-alb-identity' }}" >> $GITHUB_ENV
 
