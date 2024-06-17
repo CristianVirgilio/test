@@ -21,7 +21,7 @@ jobs:
      
       - name: Azure Custom Login
         shell: bash
-        run: az login --service-principal -u ${{ secrets.CLIENT_ID }} -p ${{ secrets.SECRET_VALUE }} --tenant ${{ secrets.TENANT_ID }}
+        run: az login --service-principal -u '${{ secrets.CLIENT_ID }}' -p '${{ secrets.SECRET_VALUE }}' --tenant '${{ secrets.TENANT_ID }}'
       
       - name: Setup Variables
         shell: bash
