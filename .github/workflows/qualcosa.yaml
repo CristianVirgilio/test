@@ -1,0 +1,308 @@
+name: AKS with ALB Controller deployment
+#comment
+on:
+  workflow_dispatch:
+    inputs:
+        resource-group-name:
+          type: string
+          required: false
+          description: 'Name of the resource group where aks will be created'
+        aks-name:
+          type: string
+          required: false
+          description: 'Name of the aks will be created'
+
+jobs:
+  create-aks-ifnotexist-create-alb:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v2
+     
+      - name: Azure Custom Login
+        shell: bash
+        run: az login --service-principal -u ${{ secrets.CLIENT_ID }} -p ${{ secrets.SECRET_VALUE }} --tenant ${{ secrets.TENANT_ID }}
+      
+      - name: Setup Variables
+        shell: bash
+        run: |
+          echo "RESOURCE_GROUP=${{ github.event.inputs.resource-group-name || 'ic-aks-rg' }}" >> $GITHUB_ENV
+
+          echo "AKS_NAME=${{ github.event.inputs.aks-name || 'ic-aks' }}" >> $GITHUB_ENV
+
+          echo "SUBSCRIPTION_ID=${{ 'c550fb2d-3f43-40b7-9e36-f1d47f436e42' }}" >> $GITHUB_ENV
+
+          echo "IDENTITY_RESOURCE_NAME=${{ 'azure-alb-identity' }}" >> $GITHUB_ENV
+
+          echo "HELM_NAMESPACE=${{ github.event.inputs.aks-name || 'ic-aks' }}" >> $GITHUB_ENV
+
+          echo "CONTROLLER_NAMESPACE=${{ 'azure-alb-system' }}" >> $GITHUB_ENV
+
+      - name: Deploy resource group and AKS
+        shell: bash
+        run: |
+          az group create --name $RESOURCE_GROUP --location eastus
+          OUTPUT=$(az aks list | jq -r '.[].name')
+
+            if [[ "$OUTPUT" == "$AKS_NAME" ]]; then
+              echo "AKS cluster already exists"
+            else
+              echo "Creating AKS cluster"
+              az aks create -n $AKS_NAME -g $RESOURCE_GROUP -l eastus --generate-ssh-keys
+              az aks get-credentials --resource-group $RESOURCE_GROUP --name $AKS_NAME --overwrite-existing
+            fi
+ 
+      - name: Register azure account and required resource providers
+        shell: bash
+        run: |
+          az account set --subscription $SUBSCRIPTION_ID
+
+          # Register required resource providers on Azure.
+          az provider register --namespace Microsoft.ContainerService
+          az provider register --namespace Microsoft.Network
+          az provider register --namespace Microsoft.NetworkFunction
+          az provider register --namespace Microsoft.ServiceNetworking
+
+          # Install Azure CLI extensions.
+          az extension add --name alb
+
+      - name: Deploy Application Gateway for Containers ALB Controller
+        shell: bash
+        run: |
+          echo "Setting up an existing cluster as workload"
+          az aks update -g $RESOURCE_GROUP -n $AKS_NAME --enable-oidc-issuer --enable-workload-identity --no-wait
+
+      - name: Create a user managed identity for ALB controller and federate the identity as workload identity to use in the AKS cluster
+        shell: bash
+        run: |
+          {
+              mcResourceGroup=$(az aks show --resource-group $RESOURCE_GROUP --name $AKS_NAME --query "nodeResourceGroup" -o tsv)
+              mcResourceGroupId=$(az group show --name $mcResourceGroup --query id -otsv)
+
+              echo "Creating identity $IDENTITY_RESOURCE_NAME in resource group $RESOURCE_GROUP"
+              az identity create --resource-group $RESOURCE_GROUP --name $IDENTITY_RESOURCE_NAME
+              principalId="$(az identity show -g $RESOURCE_GROUP -n $IDENTITY_RESOURCE_NAME --query principalId -otsv)"
+
+              echo "Waiting 60 seconds to allow for replication of the identity..."
+              sleep 60
+
+              echo "Apply Reader role to the AKS managed cluster resource group for the newly provisioned identity"
+              az role assignment create --assignee-object-id $principalId --assignee-principal-type ServicePrincipal --scope $mcResourceGroupId --role "acdd72a7-3385-48ef-bd42-f606fba81ae7" # Reader role
+
+              echo "Set up federation with AKS OIDC issuer"
+              AKS_OIDC_ISSUER="$(az aks show -n "$AKS_NAME" -g "$RESOURCE_GROUP" --query "oidcIssuerProfile.issuerUrl" -o tsv)"
+              az identity federated-credential create --name "azure-alb-identity" \
+                  --identity-name "$IDENTITY_RESOURCE_NAME" \
+                  --resource-group $RESOURCE_GROUP \
+                  --issuer "$AKS_OIDC_ISSUER" \
+                  --subject "system:serviceaccount:azure-alb-system:alb-controller-sa"
+          }
+
+      - name: Install ALB Controller using Helm
+        shell: bash
+        run: |
+            echo "doing aks get credentials"
+            az aks get-credentials --resource-group $RESOURCE_GROUP --name $AKS_NAME
+            echo "aks get credentials done"
+
+            echo "printing HELM_NAMESPACE:"
+            echo $HELM_NAMESPACE
+
+            
+            # Install ALB Controller using Helm
+            NAMESPACE_EXISTS=$(kubectl get namespaces | grep -w $HELM_NAMESPACE || true)            # problem here
+            echo "NAMESPACE_EXISTS variable assigned1"
+            echo "printing NAMESPACE_EXISTS:"
+            echo $NAMESPACE_EXISTS
+
+            if [[ -n $NAMESPACE_EXISTS ]]; then
+              echo "entered if true condition"
+              echo "Namespace '$HELM_NAMESPACE' already exists."
+            else
+                echo "entered else false condition"
+                kubectl create namespace $HELM_NAMESPACE
+                helm install alb-controller oci://mcr.microsoft.com/application-lb/charts/alb-controller --version 1.0.2 --set albController.namespace=$CONTROLLER_NAMESPACE --set albController.podIdentity.clientID=$(az identity show -g $RESOURCE_GROUP -n azure-alb-identity --query clientId -o tsv)
+            fi
+
+
+
+      - name: Verify ALB Controller installation
+        shell: bash
+        run: |
+          # Verify ALB Controller installation
+          {
+
+              echo "getting cluster credentials"
+              az aks get-credentials -n $AKS_NAME -g $RESOURCE_GROUP
+
+              kubectl get pods -n azure-alb-system && sleep 5                        # Verify the ALB Controller pods are ready
+
+              kubectl get gatewayclass azure-alb-external -o yaml && sleep 5         # Verify GatewayClass azure-application-lb is installed on your cluster:
+          }
+
+      - name: Export MC RESOURCE GROUP ENV
+        shell: bash
+        run: |
+            MC_RESOURCE_GROUP=$(az aks show --name $AKS_NAME --resource-group $RESOURCE_GROUP --query "nodeResourceGroup" -otsv | tr -d '\r')
+            echo "MC_RESOURCE_GROUP=$MC_RESOURCE_GROUP" >> $GITHUB_ENV
+
+      - name: Export Environment Variables in PowerShell
+        shell: pwsh
+        run: |
+          echo "MC_RESOURCE_GROUP IS"
+          echo $env:MC_RESOURCE_GROUP
+          $CLUSTER_SUBNET_ID = (az vmss list --resource-group $env:MC_RESOURCE_GROUP --query '[0].virtualMachineProfile.networkProfile.networkInterfaceConfigurations[0].ipConfigurations[0].subnet.id' -o tsv)
+          $vnet = az network vnet show --ids $CLUSTER_SUBNET_ID --query '[name, resourceGroup, id]' -o tsv
+          $vnetData = $vnet -split "`t"
+          $VNET_NAME = $vnetData[0]
+          $VNET_RESOURCE_GROUP = $vnetData[1]
+          $VNET_ID = $vnetData[2]
+
+          $jsonData = @{
+            CLUSTER_SUBNET_ID = $CLUSTER_SUBNET_ID
+            VNET_NAME = $VNET_NAME
+            VNET_RESOURCE_GROUP = $VNET_RESOURCE_GROUP
+            VNET_ID = $VNET_ID
+          } | ConvertTo-Json -Compress
+
+          $jsonData | Set-Content -Path "env_vars.json"
+
+
+
+      - name: create a new subnet containing at least 250 available IP addresses and enable subnet delegation for the Application Gateway for Containers association resource if it doesn't exist
+        shell: bash
+        run: |
+          env_vars=$(cat env_vars.json)
+          CLUSTER_SUBNET_ID=$(echo $env_vars | jq -r '.CLUSTER_SUBNET_ID')
+          VNET_NAME=$(echo $env_vars | jq -r '.VNET_NAME')
+          VNET_RESOURCE_GROUP=$(echo $env_vars | jq -r '.VNET_RESOURCE_GROUP')
+          VNET_ID=$(echo $env_vars | jq -r '.VNET_ID')
+
+          echo "CLUSTER_SUBNET_ID: $CLUSTER_SUBNET_ID"
+          echo "VNET_NAME: $VNET_NAME"
+          echo "VNET_RESOURCE_GROUP: $VNET_RESOURCE_GROUP"
+          echo "VNET_ID: $VNET_ID"
+
+          SUBNET_EXISTS=$(az network vnet subnet list --resource-group $VNET_RESOURCE_GROUP --vnet-name $VNET_NAME --query "[?name=='$ALB_SUBNET_NAME']" --output tsv)
+
+          if [[ -n $SUBNET_EXISTS ]]; then
+            echo "Subnet '$ALB_SUBNET_NAME' already exists in VNet '$VNET_NAME'."
+          else
+            SUBNET_ADDRESS_PREFIX='10.225.0.0/24'
+            echo "SUBNET_ADDRESS_PREFIX=$SUBNET_ADDRESS_PREFIX" >> $GITHUB_ENV
+            
+            ALB_SUBNET_NAME='subnet-alb' # subnet name can be any non-reserved subnet name (i.e. GatewaySubnet, AzureFirewallSubnet, AzureBastionSubnet would all be invalid)
+            echo "ALB_SUBNET_NAME=$ALB_SUBNET_NAME" >> $GITHUB_ENV
+            
+            az network vnet subnet create --resource-group $VNET_RESOURCE_GROUP --vnet-name $VNET_NAME --name $ALB_SUBNET_NAME --address-prefixes $SUBNET_ADDRESS_PREFIX --delegations 'Microsoft.ServiceNetworking/trafficControllers'
+            
+            ALB_SUBNET_ID=$(az network vnet subnet show --name $ALB_SUBNET_NAME --resource-group $VNET_RESOURCE_GROUP --vnet-name $VNET_NAME --query '[id]' --output tsv)
+            echo "ALB_SUBNET_ID=$ALB_SUBNET_ID" >> $GITHUB_ENV
+          fi
+
+      - name: Create and assign a custom role
+        shell: bash
+        run: |
+          echo "ALB_SUBNET_ID is $ALB_SUBNET_ID"
+          exit 0
+          mcResourceGroupId=$(az group show --name $MC_RESOURCE_GROUP --query id -otsv)
+          principalId=$(az identity show -g $RESOURCE_GROUP -n $IDENTITY_RESOURCE_NAME --query principalId -otsv)
+          
+          # Delegate AppGw for Containers Configuration Manager role to AKS Managed Cluster RG
+          az role assignment create --assignee-object-id $principalId --assignee-principal-type ServicePrincipal --scope $mcResourceGroupId --role "fbc52c3f-28ad-4303-a892-8a056630b8f1" 
+          
+          # Delegate Network Contributor permission for join to association subnet
+          az role assignment create --assignee-object-id $principalId --assignee-principal-type ServicePrincipal --scope $ALB_SUBNET_ID --role "4d97b98b-1d4f-4787-a291-c67834d212e7" 
+        
+      - name: Create ApplicationLoadBalancer Kubernetes resource
+        shell: bash
+        run: |
+            echo "Define the Kubernetes namespace for the ApplicationLoadBalancer resource"
+            kubectl apply -f - <<EOF
+            apiVersion: v1
+            kind: Namespace
+            metadata:
+              name: alb-test-infra
+            EOF
+
+            echo "create the Application Gateway for Containers resource and association."
+            kubectl apply -f - <<EOF
+            apiVersion: alb.networking.azure.io/v1
+            kind: ApplicationLoadBalancer
+            metadata:
+              name: alb-test
+              namespace: alb-test-infra
+            spec:
+              associations:
+              - $ALB_SUBNET_ID
+            EOF
+
+      - name: Validate creation of the Application Gateway for Containers resources
+        shell: bash
+        run: |
+          kubectl get applicationloadbalancer alb-test -n alb-test-infra -o yaml
+          sleep 10
+
+      - name: Apply sample deployment
+        shell: bash
+        run: kubectl apply -f https://trafficcontrollerdocs.blob.core.windows.net/examples/traffic-split-scenario/deployment.yaml
+      
+      - name: Deploy required Gateway API resources
+        shell: bash
+        run: |
+          kubectl apply -f - <<EOF
+            apiVersion: gateway.networking.k8s.io/v1
+            kind: Gateway
+            metadata:
+              name: gateway-01
+              namespace: test-infra
+              annotations:
+                alb.networking.azure.io/alb-namespace: alb-test-infra
+                alb.networking.azure.io/alb-name: alb-test
+            spec:
+              gatewayClassName: azure-alb-external
+              listeners:
+              - name: http
+                port: 80
+                protocol: HTTP
+                allowedRoutes:
+                  namespaces:
+                    from: Same
+          EOF
+            echo "check successfull gateway cration"
+            kubectl get gateway gateway-01 -n test-infra -o yaml
+            sleep 5
+
+      - name: Create an HTTP Route
+        shell: bash
+        run: | 
+          kubectl apply -f - <<EOF
+            apiVersion: gateway.networking.k8s.io/v1
+            kind: HTTPRoute
+            metadata:
+              name: traffic-split-route
+              namespace: test-infra
+            spec:
+              parentRefs:
+              - name: gateway-01
+              rules:
+              - backendRefs:
+                - name: backend-v1
+                  port: 8080
+                  weight: 50
+                - name: backend-v2
+                  port: 8080
+                  weight: 50
+          EOF
+          echo "Ensure the route is accepted adn the app gw for containers is programmed"
+          kubectl get httproute traffic-split-route -n test-infra -o yaml
+          sleep 5
+      - name: Testing access to the application
+        shell: bash
+        run: | 
+          fqdn=$(kubectl get gateway gateway-01 -n test-infra -o jsonpath='{.status.addresses[0].value}')
+          # this curl command will return 50% of the responses from backend-v1
+          # and the remaining 50% of the responses from backend-v2
+          watch -n 1 curl http://$fqdn
+          watch -n 1 curl http://$fqdn
+          watch -n 1 curl http://$fqdn
